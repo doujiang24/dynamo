@@ -163,13 +163,19 @@ async fn spawn_indexer_http(
 fn make_app_state(registry: Arc<WorkerRegistry>) -> Arc<AppState> {
     Arc::new(AppState {
         registry,
+        log_file_writer: None,
+        access_log_writer: None,
         prom_registry: prometheus::Registry::new(),
     })
 }
 
 #[cfg(not(feature = "metrics"))]
 fn make_app_state(registry: Arc<WorkerRegistry>) -> Arc<AppState> {
-    Arc::new(AppState { registry })
+    Arc::new(AppState {
+        registry,
+        log_file_writer: None,
+        access_log_writer: None,
+    })
 }
 
 /// `/query_by_hash` against a populated registry must surface both the legacy

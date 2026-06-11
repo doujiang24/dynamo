@@ -4,6 +4,7 @@
 use pythonize::{depythonize, pythonize};
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
@@ -98,6 +99,18 @@ struct KvIndexerCli {
     /// Comma-separated peer URLs for P2P recovery (e.g. "http://host1:8090,http://host2:8091")
     #[arg(long)]
     peers: Option<String>,
+
+    /// Write tracing logs to this file instead of stderr
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+
+    /// Write access log (JSON lines) to this file
+    #[arg(long)]
+    access_log: Option<PathBuf>,
+
+    /// HTTP header name to extract trace-id from
+    #[arg(long, default_value = "x-trace-id")]
+    trace_id_header: String,
 }
 
 pub fn run_kv_indexer_cli<I, T>(args: I) -> anyhow::Result<()>
@@ -112,18 +125,24 @@ where
                 .chain(args.into_iter().map(Into::into)),
         )?;
 
-        init_standalone_logging();
+        let log_file_writer = init_standalone_logging(cli.log_file.as_deref());
 
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(indexer::run_server(IndexerConfig {
-            block_size: cli.block_size,
-            port: cli.port,
-            threads: cli.threads,
-            workers: cli.workers,
-            model_name: cli.model_name,
-            tenant_id: cli.tenant_id,
-            peers: cli.peers,
-        }))
+        rt.block_on(indexer::run_server(
+            IndexerConfig {
+                block_size: cli.block_size,
+                port: cli.port,
+                threads: cli.threads,
+                workers: cli.workers,
+                model_name: cli.model_name,
+                tenant_id: cli.tenant_id,
+                peers: cli.peers,
+                log_file: cli.log_file,
+                access_log: cli.access_log,
+                trace_id_header: cli.trace_id_header,
+            },
+            log_file_writer,
+        ))
     }
 
     #[cfg(not(feature = "kv-indexer"))]
@@ -171,7 +190,7 @@ where
                 .chain(args.into_iter().map(Into::into)),
         )?;
 
-        init_standalone_logging();
+        init_standalone_logging_stderr();
 
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(slot_tracker::run_server(SlotTrackerConfig {
@@ -191,8 +210,37 @@ where
     }
 }
 
-#[cfg(any(feature = "kv-indexer", feature = "slot-tracker"))]
-fn init_standalone_logging() {
+#[cfg(feature = "kv-indexer")]
+fn init_standalone_logging(
+    log_file: Option<&std::path::Path>,
+) -> Option<Arc<dynamo_kv_router::services::indexer::logging::ReopenableWriter>> {
+    use dynamo_kv_router::services::indexer::logging::{ReopenableWriter, SharedReopenableWriter};
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if let Some(path) = log_file {
+        let writer = Arc::new(ReopenableWriter::new(path).expect("failed to open log file"));
+        let shared = SharedReopenableWriter(writer.clone());
+        match tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(shared)
+            .try_init()
+        {
+            Ok(()) => {}
+            Err(e) => eprintln!("warning: failed to initialize file logger: {e}"),
+        }
+        Some(writer)
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+        None
+    }
+}
+
+#[cfg(feature = "slot-tracker")]
+fn init_standalone_logging_stderr() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -25,11 +25,13 @@
 
 pub mod backend;
 pub mod listener;
+pub mod logging;
 pub mod metrics;
 pub mod recovery;
 pub mod registry;
 pub mod server;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::min_initial_workers_from_env;
 use crate::services::zmq::validate_endpoint as validate_zmq_endpoint;
+use logging::{AccessLogWriter, ReopenableWriter};
 use registry::WorkerRegistry;
 use server::{AppState, create_router};
 
@@ -49,6 +52,9 @@ pub struct IndexerConfig {
     pub model_name: String,
     pub tenant_id: String,
     pub peers: Option<String>,
+    pub log_file: Option<PathBuf>,
+    pub access_log: Option<PathBuf>,
+    pub trace_id_header: String,
 }
 
 pub(super) fn validate_listener_endpoints(
@@ -98,7 +104,10 @@ pub fn parse_workers(s: &str) -> anyhow::Result<Vec<(u64, u32, String)>> {
     Ok(workers)
 }
 
-pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
+pub async fn run_server(
+    config: IndexerConfig,
+    log_file_writer: Option<Arc<ReopenableWriter>>,
+) -> anyhow::Result<()> {
     let cancel_token = CancellationToken::new();
     let shutdown_token = cancel_token.clone();
     tokio::spawn(async move {
@@ -129,7 +138,7 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     );
 
     let registry = Arc::new(WorkerRegistry::new(config.threads));
-    run_common(&config, &registry, cancel_token).await
+    run_common(&config, &registry, cancel_token, log_file_writer).await
 }
 
 async fn wait_for_min_initial_workers(
@@ -163,6 +172,7 @@ async fn run_common(
     config: &IndexerConfig,
     registry: &Arc<WorkerRegistry>,
     cancel_token: CancellationToken,
+    log_file_writer: Option<Arc<ReopenableWriter>>,
 ) -> anyhow::Result<()> {
     if let Some(ref workers_str) = config.workers {
         let block_size = config.block_size.ok_or_else(|| {
@@ -209,6 +219,15 @@ async fn run_common(
     wait_for_min_initial_workers(registry, &cancel_token).await?;
     registry.signal_ready();
 
+    let access_log_writer = match config.access_log {
+        Some(ref path) => {
+            let w = AccessLogWriter::new(path, config.trace_id_header.clone())
+                .map_err(|e| anyhow::anyhow!("failed to open access log {}: {e}", path.display()))?;
+            Some(Arc::new(w))
+        }
+        None => None,
+    };
+
     #[cfg(feature = "metrics")]
     let prom_registry = {
         let r = prometheus::Registry::new();
@@ -218,6 +237,8 @@ async fn run_common(
 
     let state = Arc::new(AppState {
         registry: registry.clone(),
+        log_file_writer,
+        access_log_writer: access_log_writer.clone(),
         #[cfg(feature = "metrics")]
         prom_registry,
     });
